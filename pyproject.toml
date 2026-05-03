@@ -1,0 +1,20 @@
+[project]
+name = "beam-kompas-optimizer"
+version = "0.1.0"
+description = "Локальная система подбора балки и экспорта моделей в КОМПАС-3D"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+kompas = ["pywin32>=306; platform_system == 'Windows'"]
+
+[project.scripts]
+beam-kompas-optimizer = "beam_optimizer.gui:run_app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["beam_optimizer"]
