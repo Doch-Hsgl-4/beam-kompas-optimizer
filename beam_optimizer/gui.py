@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -91,6 +92,8 @@ class BeamOptimizerApp:
         self.max_stress_var = tk.StringVar(value="160")
         self.max_deflection_var = tk.StringVar(value="5")
         self.min_safety_var = tk.StringVar(value="1.5")
+        self.max_primary_dim_var = tk.StringVar(value="")
+        self.max_secondary_dim_var = tk.StringVar(value="")
         self.goal_var = tk.StringVar(value="Самая лёгкая балка")
         self.goal_description_var = tk.StringVar(value=GOAL_DESCRIPTIONS[self.goal_var.get()])
         self.top_n_var = tk.StringVar(value="5")
@@ -105,6 +108,8 @@ class BeamOptimizerApp:
         self.current_candidates = []
         self.current_report_path: Path | None = None
         self.cad_adapter: KompasAdapter | None = None
+
+        self._optimization_running = False
 
         self._build_layout()
         self._bind_events()
@@ -157,18 +162,20 @@ class BeamOptimizerApp:
     def _build_constraints_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Ограничения и критерий выбора", padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
-        self._add_labeled_entry(frame, "Максимальное напряжение, МПа", self.max_stress_var, row=0)
-        self._add_labeled_entry(frame, "Максимальный прогиб, мм", self.max_deflection_var, row=1)
-        self._add_labeled_entry(frame, "Минимальный коэффициент запаса", self.min_safety_var, row=2)
-        self._add_labeled_combo(frame, "Как выбрать лучший вариант", self.goal_var, list(GOAL_OPTIONS.keys()), row=3)
+        self._add_labeled_entry(frame, "Макс. напряжение, МПа (пусто = без лим.)", self.max_stress_var, row=0)
+        self._add_labeled_entry(frame, "Макс. прогиб, мм (пусто = без лим.)", self.max_deflection_var, row=1)
+        self._add_labeled_entry(frame, "Мин. коэф. запаса (пусто = без лим.)", self.min_safety_var, row=2)
+        self._add_labeled_entry(frame, "Макс. осн. размер, мм (пусто = без лим.)", self.max_primary_dim_var, row=3)
+        self._add_labeled_entry(frame, "Макс. доп. размер, мм (пусто = без лим.)", self.max_secondary_dim_var, row=4)
+        self._add_labeled_combo(frame, "Как выбрать лучший вариант", self.goal_var, list(GOAL_OPTIONS.keys()), row=5)
         description_label = ttk.Label(
             frame,
             textvariable=self.goal_description_var,
             wraplength=280,
             justify=tk.LEFT,
         )
-        description_label.grid(row=10, column=0, sticky="w", pady=(2, 8))
-        self._add_labeled_entry(frame, "Сколько лучших вариантов показать", self.top_n_var, row=4)
+        description_label.grid(row=12, column=0, sticky="w", pady=(2, 8))
+        self._add_labeled_entry(frame, "Сколько лучших вариантов показать", self.top_n_var, row=6)
 
     def _build_actions_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Запуск", padding=10)
@@ -180,12 +187,12 @@ class BeamOptimizerApp:
         ttk.Checkbutton(frame, text="Создавать модель в КОМПАС", variable=self.create_model_var).grid(
             row=1, column=0, sticky="w", pady=(0, 10)
         )
-        ttk.Button(frame, text="Запустить подбор", command=self.run_workflow).grid(
-            row=2, column=0, sticky="ew", pady=(6, 6)
-        )
-        ttk.Button(frame, text="Очистить все результаты", command=self.clear_results).grid(
-            row=3, column=0, sticky="ew", pady=6
-        )
+        self._run_button = ttk.Button(frame, text="Запустить подбор", command=self.run_workflow)
+        self._run_button.grid(row=2, column=0, sticky="ew", pady=(6, 6))
+        self._clear_button = ttk.Button(frame, text="Очистить все результаты", command=self.clear_results)
+        self._clear_button.grid(row=3, column=0, sticky="ew", pady=6)
+        self._status_label = ttk.Label(frame, text="", foreground="gray", wraplength=280, justify=tk.LEFT)
+        self._status_label.grid(row=4, column=0, sticky="w", pady=(6, 0))
         frame.columnconfigure(0, weight=1)
 
     def _build_results(self, parent: ttk.Frame) -> None:
@@ -331,14 +338,44 @@ class BeamOptimizerApp:
             logger.info("Closed %s KOMPAS document(s) from output before cleanup.", len(released))
 
     def run_workflow(self) -> None:
+        if self._optimization_running:
+            return
         try:
             self._release_kompas_locks()
             request = self._build_request()
+        except Exception as error:
+            messagebox.showerror("Ошибка ввода", str(error))
+            return
+
+        self._set_running(True)
+        thread = threading.Thread(target=self._run_in_thread, args=(request,), daemon=True)
+        thread.start()
+
+    # Thread-safety note: all mutations of shared instance attributes
+    # (current_candidates, cad_adapter, etc.) happen exclusively on the Tk
+    # main thread — either directly in UI callbacks or via root.after(0, …).
+    # The background thread (_run_in_thread) is read-only: it receives an
+    # immutable BeamRequest and communicates results only through root.after.
+    def _set_running(self, running: bool) -> None:
+        self._optimization_running = running
+        state = tk.DISABLED if running else tk.NORMAL
+        self._run_button.configure(state=state)
+        self._clear_button.configure(state=state)
+        self._status_label.configure(text="Вычисление... Пожалуйста, подождите." if running else "")
+
+    def _run_in_thread(self, request: BeamRequest) -> None:
+        try:
             directories = ensure_output_structure(request.output_dir)
             log_path = configure_logging(directories["logs"])
             logger.info("Workflow started")
-
             summary = run_optimization(request)
+            self.root.after(0, self._on_optimization_done, request, directories, log_path, summary)
+        except Exception as error:
+            logger.exception("Workflow failed: %s", error)
+            self.root.after(0, self._on_optimization_error, error)
+
+    def _on_optimization_done(self, request: BeamRequest, directories: dict, log_path, summary) -> None:
+        try:
             self.cad_adapter = KompasAdapter() if self.create_model_var.get() else None
 
             created_m3d = 0
@@ -367,33 +404,62 @@ class BeamOptimizerApp:
                 f"Папка результатов: {self.output_dir}",
             ]
             if self.create_model_var.get():
-                summary_lines.append("Для лучших вариантов созданы модели КОМПАС.")
-            else:
-                summary_lines.append("Создание моделей КОМПАС отключено.")
-            if self.create_model_var.get():
                 summary_lines.append(f"Модели КОМПАС (.m3d): {created_m3d}")
                 if created_mock:
-                    summary_lines.append(f"Mock-файлы вместо .m3d: {created_mock}")
+                    summary_lines.append(
+                        f"⚠ Fallback: {created_mock} модель(ей) сохранена как JSON — "
+                        f"КОМПАС недоступен или не отвечает."
+                    )
+            else:
+                summary_lines.append("Создание моделей КОМПАС отключено.")
             self._set_details("\n".join(summary_lines))
+
+            if self.create_model_var.get() and created_mock:
+                messagebox.showwarning(
+                    "КОМПАС недоступен",
+                    f"Не удалось создать {created_mock} .m3d файл(ов).\n"
+                    f"Модели сохранены как JSON-заглушки.\n"
+                    f"Убедитесь, что КОМПАС-3D запущен и доступен через COM.",
+                )
         except Exception as error:
-            logger.exception("Workflow failed: %s", error)
+            logger.exception("Post-optimization error: %s", error)
             messagebox.showerror("Ошибка", str(error))
+        finally:
+            self._set_running(False)
+
+    def _on_optimization_error(self, error: Exception) -> None:
+        self._set_running(False)
+        messagebox.showerror("Ошибка вычисления", str(error))
 
     def _build_request(self) -> BeamRequest:
         section_type = SECTION_OPTIONS[self.section_var.get()]
         load_type = LOAD_OPTIONS[self.load_var.get()]
+
+        primary_min = self._parse_float(self.primary_min_var.get())
+        primary_max = self._parse_float(self.primary_max_var.get())
+        if primary_min <= 0 or primary_max <= 0:
+            raise ValueError("Размеры сечения должны быть положительными.")
+        if primary_min > primary_max:
+            raise ValueError("Минимальный основной размер не может превышать максимальный.")
+
         secondary_range = None
         if section_type not in SINGLE_DIMENSION_SECTIONS:
+            secondary_min = self._parse_float(self.secondary_min_var.get())
+            secondary_max = self._parse_float(self.secondary_max_var.get())
+            if secondary_min <= 0 or secondary_max <= 0:
+                raise ValueError("Размеры сечения должны быть положительными.")
+            if secondary_min > secondary_max:
+                raise ValueError("Минимальный вторичный размер не может превышать максимальный.")
             secondary_range = NumericRange(
-                min_value=self._parse_float(self.secondary_min_var.get()),
-                max_value=self._parse_float(self.secondary_max_var.get()),
+                min_value=secondary_min,
+                max_value=secondary_max,
                 step=self._extreme_step(self.secondary_min_var.get(), self.secondary_max_var.get()),
             )
 
         search_space = SectionSearchSpace(
             primary=NumericRange(
-                min_value=self._parse_float(self.primary_min_var.get()),
-                max_value=self._parse_float(self.primary_max_var.get()),
+                min_value=primary_min,
+                max_value=primary_max,
                 step=self._extreme_step(self.primary_min_var.get(), self.primary_max_var.get()),
             ),
             secondary=secondary_range,
@@ -411,6 +477,8 @@ class BeamOptimizerApp:
             max_stress_pa=self._optional_float(self.max_stress_var.get(), scale=1e6),
             max_deflection_m=self._optional_float(self.max_deflection_var.get(), scale=1e-3),
             min_safety_factor=self._optional_float(self.min_safety_var.get()),
+            max_primary_dimension_mm=self._optional_float(self.max_primary_dim_var.get()),
+            max_secondary_dimension_mm=self._optional_float(self.max_secondary_dim_var.get()),
         )
 
         request = BeamRequest(
@@ -433,9 +501,12 @@ class BeamOptimizerApp:
         if (
             request.load_case.load_type == LoadType.POINT_AT_POSITION
             and request.load_case.position_m is not None
-            and not (0.0 < request.load_case.position_m < request.length_m)
+            and not (0.0 < request.load_case.position_m <= request.length_m)
         ):
-            raise ValueError("Координата сосредоточенной силы должна находиться внутри балки.")
+            raise ValueError(
+                "Координата сосредоточенной силы должна быть в пределах (0, L]. "
+                "Для консоли допустима нагрузка на свободном конце (x = L)."
+            )
         return request
 
     def _fill_tree(self, selected, alternatives) -> None:

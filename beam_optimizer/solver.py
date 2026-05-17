@@ -1,12 +1,81 @@
+"""1-D Euler-Bernoulli beam finite element solver.
+
+Method
+------
+Each beam element uses cubic Hermitian shape functions, giving 2 DOFs per node
+(transverse displacement w and rotation θ = dw/dx).  The 4×4 element stiffness
+matrix is assembled into the global system, boundary conditions are enforced by
+eliminating constrained DOFs, and the reduced system is solved with Gaussian
+elimination with partial pivoting.
+
+Bending moments are recovered from element curvature κ = d²w/dx², sampled at
+11 points per element (exact within the element — curvature varies linearly for
+a Hermitian element).
+
+References
+----------
+Bathe K.J. (2014). *Finite Element Procedures*, 2nd ed., §5.4. Prentice-Hall.
+Zienkiewicz O.C., Taylor R.L. (2000). *The Finite Element Method*, Vol. 1,
+    ch. 4. Butterworth-Heinemann.
+"""
 from __future__ import annotations
+
+import logging
+import math
 
 from beam_optimizer.models import AnalysisResult, BeamRequest, LoadType, SectionVariant, SupportType
 
+logger = logging.getLogger(__name__)
 
+# 60 elements yields < 0.1 % error vs. closed-form for standard load cases
+# (verified in tests/test_optimizer.py: SolverFEMVerificationTests).
+# Increasing this improves accuracy at the cost of O(n²) matrix assembly time.
 DEFAULT_ELEMENTS = 60
+
+# Euler-Bernoulli theory assumes transverse shear deformation is negligible.
+# This holds when L/h > ~10 (L = span, h = cross-section height).
+# Below this threshold shear deformation is significant → use Timoshenko theory.
+# See: Reddy J.N. (1997). *On locking-free shear deformable beam finite elements*.
+_SLENDERNESS_THRESHOLD = 10.0
+
+# Pivot threshold for Gaussian elimination.  Values below this are treated as
+# zero — stiffness matrix is singular (under-constrained model).
+# For well-conditioned beam problems, the smallest meaningful pivot is orders of
+# magnitude larger, so 1e-14 ≈ 50× machine epsilon is a safe lower bound.
+_SINGULARITY_TOLERANCE = 1e-14
 
 
 def analyze_section(request: BeamRequest, section: SectionVariant) -> AnalysisResult:
+    """Analyse a single cross-section variant under the given load case.
+
+    Parameters
+    ----------
+    request : BeamRequest
+        Full problem specification (geometry, material, supports, load).
+    section : SectionVariant
+        Pre-computed cross-section properties (A, I, W).
+
+    Returns
+    -------
+    AnalysisResult
+        Maximum bending moment, stress, deflection, mass, and safety factor.
+
+    Notes
+    -----
+    Safety factor is defined as σ_y / σ_max.  If max_stress ≤ 1e-12 Pa (zero
+    load), the safety factor is returned as +∞ — the section is trivially safe.
+    """
+    # h_equiv = height of a rectangle with the same I/A ratio; equals actual
+    # height for rectangular sections and 0.866·d for solid-round sections.
+    h_equiv = 2.0 * math.sqrt(3.0 * section.inertia_m4 / section.area_m2)
+    slenderness = request.length_m / h_equiv
+    if slenderness < _SLENDERNESS_THRESHOLD:
+        logger.warning(
+            "Коэффициент гибкости L/h = %.1f < 10 для сечения '%s'. "
+            "Теория Эйлера-Бернулли даёт заниженные напряжения для коротких толстых балок.",
+            slenderness,
+            section.title,
+        )
     nodes = _build_nodes(request.length_m, request.load_case)
     stiffness = _zeros_matrix(2 * len(nodes), 2 * len(nodes))
     load_vector = [0.0 for _ in range(2 * len(nodes))]
@@ -71,6 +140,12 @@ def _build_nodes(length_m: float, load_case) -> list[float]:
 
 
 def _beam_element_stiffness(elastic_modulus: float, inertia: float, length: float) -> list[list[float]]:
+    """Return the 4×4 Hermitian beam element stiffness matrix.
+
+    DOF order: [w_1, θ_1, w_2, θ_2] (deflection, rotation at each node).
+    The matrix is derived from the potential energy of an Euler-Bernoulli beam:
+    U = (EI/2) ∫ (d²w/dx²)² dx.  See Bathe (2014) §5.4, eq. (5.28).
+    """
     factor = elastic_modulus * inertia / length**3
     l = length
     return [
@@ -150,7 +225,7 @@ def _gaussian_elimination(matrix: list[list[float]], vector: list[float]) -> lis
 
     for pivot in range(size):
         max_row = max(range(pivot, size), key=lambda row: abs(a[row][pivot]))
-        if abs(a[max_row][pivot]) <= 1e-14:
+        if abs(a[max_row][pivot]) <= _SINGULARITY_TOLERANCE:
             raise ValueError("Singular stiffness matrix.")
         if max_row != pivot:
             a[pivot], a[max_row] = a[max_row], a[pivot]
@@ -200,6 +275,12 @@ def _estimate_max_moment(
 
 
 def _curvature(xi: float, length: float, local_dofs: list[float]) -> float:
+    """Return d²w/dx² at local coordinate ξ ∈ [0, 1] using Hermitian shape functions.
+
+    The curvature varies *linearly* within each Hermitian beam element, so
+    sampling at ξ = 0, 0.1, …, 1.0 captures the exact curvature profile.
+    Bending moment M = EI · κ follows directly.
+    """
     coefficients = [
         (-6.0 + 12.0 * xi) / length**2,
         (-4.0 + 6.0 * xi) / length,

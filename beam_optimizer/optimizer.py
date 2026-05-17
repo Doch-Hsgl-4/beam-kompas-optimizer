@@ -30,6 +30,22 @@ SECONDARY_DIMENSION_KEYS = {
 
 
 def run_optimization(request: BeamRequest) -> OptimizationSummary:
+    """Run the full beam optimization pipeline.
+
+    Steps:
+    1. Generate all cross-section variants within the search space.
+    2. Analyse each variant with the 1-D FEM solver.
+    3. Separate feasible (all constraints satisfied) from infeasible candidates.
+    4. Rank feasible candidates by the requested optimisation goal (min mass or
+       max safety factor), using secondary keys for tie-breaking.
+    5. Return the top *top_n* feasible candidates as *selected*.
+       If no feasible candidate exists, return the top *top_n* infeasible
+       candidates as *alternatives* so the user can see which constraints fail.
+
+    Complexity: O(N · M) where N = number of section variants and M = number of
+    FEM elements (DEFAULT_ELEMENTS = 60).  Ranking uses heapq.nsmallest which
+    runs in O(N log top_n).
+    """
     sections = generate_section_variants(request.section_type, request.search_space)
     if not sections:
         raise ValueError("По заданному диапазону не удалось сгенерировать ни одного варианта сечения.")
@@ -50,22 +66,18 @@ def run_optimization(request: BeamRequest) -> OptimizationSummary:
     feasible_candidates = [candidate for candidate in candidates if candidate.is_feasible]
     infeasible_candidates = [candidate for candidate in candidates if not candidate.is_feasible]
 
+    sort_key = lambda candidate: _sort_key(candidate, request.optimization_goal)  # noqa: E731
     take_count = max(1, request.top_n)
-    selected = heapq.nsmallest(
-        take_count,
-        feasible_candidates,
-        key=lambda candidate: _sort_key(candidate, request.optimization_goal),
-    )
-    if len(selected) < take_count and infeasible_candidates:
-        selected.extend(
-            heapq.nsmallest(
-                take_count - len(selected),
-                infeasible_candidates,
-                key=lambda candidate: _sort_key(candidate, request.optimization_goal),
-            )
-        )
 
-    alternatives: list[CandidateResult] = []
+    selected = heapq.nsmallest(take_count, feasible_candidates, key=sort_key)
+    # When no feasible solution exists, populate alternatives with the closest infeasible
+    # candidates so the user can see which constraints are violated and by how much.
+    alternatives = (
+        heapq.nsmallest(take_count, infeasible_candidates, key=sort_key)
+        if not selected
+        else []
+    )
+
     return OptimizationSummary(
         total_generated=len(candidates),
         feasible_count=len(feasible_candidates),
@@ -79,6 +91,7 @@ def _check_constraints(
     analysis: AnalysisResult,
     constraints: Constraints,
 ) -> tuple[bool, list[str]]:
+    """Return (is_feasible, violation_messages) for a single candidate."""
     violations: list[str] = []
 
     if constraints.max_stress_pa is not None and analysis.max_stress_pa > constraints.max_stress_pa:
@@ -102,6 +115,13 @@ def _check_constraints(
 
 
 def _sort_key(candidate: CandidateResult, goal: OptimizationGoal) -> tuple[float, ...]:
+    """Return a tuple used as a min-heap key for ranking candidates.
+
+    For MIN_WEIGHT: primary key = mass; tie-broken by −safety_factor (prefer
+    safer), then by deflection.
+    For MAX_SAFETY_FACTOR: primary key = −safety_factor; tie-broken by mass,
+    then by deflection.
+    """
     if goal == OptimizationGoal.MAX_SAFETY_FACTOR:
         return (-candidate.analysis.safety_factor, candidate.analysis.mass_kg, candidate.analysis.max_deflection_m)
     return (
