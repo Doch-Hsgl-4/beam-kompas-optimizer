@@ -92,6 +92,8 @@ class BeamOptimizerApp:
         self.max_stress_var = tk.StringVar(value="160")
         self.max_deflection_var = tk.StringVar(value="5")
         self.min_safety_var = tk.StringVar(value="1.5")
+        self.max_primary_dim_var = tk.StringVar(value="")
+        self.max_secondary_dim_var = tk.StringVar(value="")
         self.goal_var = tk.StringVar(value="Самая лёгкая балка")
         self.goal_description_var = tk.StringVar(value=GOAL_DESCRIPTIONS[self.goal_var.get()])
         self.top_n_var = tk.StringVar(value="5")
@@ -160,18 +162,20 @@ class BeamOptimizerApp:
     def _build_constraints_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Ограничения и критерий выбора", padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
-        self._add_labeled_entry(frame, "Максимальное напряжение, МПа", self.max_stress_var, row=0)
-        self._add_labeled_entry(frame, "Максимальный прогиб, мм", self.max_deflection_var, row=1)
-        self._add_labeled_entry(frame, "Минимальный коэффициент запаса", self.min_safety_var, row=2)
-        self._add_labeled_combo(frame, "Как выбрать лучший вариант", self.goal_var, list(GOAL_OPTIONS.keys()), row=3)
+        self._add_labeled_entry(frame, "Макс. напряжение, МПа (пусто = без лим.)", self.max_stress_var, row=0)
+        self._add_labeled_entry(frame, "Макс. прогиб, мм (пусто = без лим.)", self.max_deflection_var, row=1)
+        self._add_labeled_entry(frame, "Мин. коэф. запаса (пусто = без лим.)", self.min_safety_var, row=2)
+        self._add_labeled_entry(frame, "Макс. осн. размер, мм (пусто = без лим.)", self.max_primary_dim_var, row=3)
+        self._add_labeled_entry(frame, "Макс. доп. размер, мм (пусто = без лим.)", self.max_secondary_dim_var, row=4)
+        self._add_labeled_combo(frame, "Как выбрать лучший вариант", self.goal_var, list(GOAL_OPTIONS.keys()), row=5)
         description_label = ttk.Label(
             frame,
             textvariable=self.goal_description_var,
             wraplength=280,
             justify=tk.LEFT,
         )
-        description_label.grid(row=10, column=0, sticky="w", pady=(2, 8))
-        self._add_labeled_entry(frame, "Сколько лучших вариантов показать", self.top_n_var, row=4)
+        description_label.grid(row=12, column=0, sticky="w", pady=(2, 8))
+        self._add_labeled_entry(frame, "Сколько лучших вариантов показать", self.top_n_var, row=6)
 
     def _build_actions_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Запуск", padding=10)
@@ -347,6 +351,11 @@ class BeamOptimizerApp:
         thread = threading.Thread(target=self._run_in_thread, args=(request,), daemon=True)
         thread.start()
 
+    # Thread-safety note: all mutations of shared instance attributes
+    # (current_candidates, cad_adapter, etc.) happen exclusively on the Tk
+    # main thread — either directly in UI callbacks or via root.after(0, …).
+    # The background thread (_run_in_thread) is read-only: it receives an
+    # immutable BeamRequest and communicates results only through root.after.
     def _set_running(self, running: bool) -> None:
         self._optimization_running = running
         state = tk.DISABLED if running else tk.NORMAL
@@ -468,6 +477,8 @@ class BeamOptimizerApp:
             max_stress_pa=self._optional_float(self.max_stress_var.get(), scale=1e6),
             max_deflection_m=self._optional_float(self.max_deflection_var.get(), scale=1e-3),
             min_safety_factor=self._optional_float(self.min_safety_var.get()),
+            max_primary_dimension_mm=self._optional_float(self.max_primary_dim_var.get()),
+            max_secondary_dimension_mm=self._optional_float(self.max_secondary_dim_var.get()),
         )
 
         request = BeamRequest(

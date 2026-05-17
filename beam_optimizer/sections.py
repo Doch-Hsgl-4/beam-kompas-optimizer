@@ -1,3 +1,13 @@
+"""Cross-section geometry generation and property calculation.
+
+All second moments of area (I) are computed for bending about the horizontal
+centroidal axis.  Section modulus W = I / c where c is the distance from the
+neutral axis to the extreme fibre.
+
+Formulas are taken from:
+    Чигарев А.В., Кравчук А.С., Смалюк А.Ф. (2004). ANSYS для инженеров. М.: Машиностроение.
+    Beer F.P., Johnston E.R. (2012). *Mechanics of Materials*, 6th ed. McGraw-Hill.
+"""
 from __future__ import annotations
 
 import math
@@ -38,6 +48,7 @@ def _mm_to_m(value_mm: float) -> float:
 
 
 def _generate_rectangular(search_space: SectionSearchSpace) -> list[SectionVariant]:
+    """I = b·h³/12,  W = b·h²/6,  A = b·h  (bending about horizontal axis)."""
     if search_space.secondary is None:
         raise ValueError("Rectangular profile requires two ranges.")
 
@@ -65,6 +76,7 @@ def _generate_rectangular(search_space: SectionSearchSpace) -> list[SectionVaria
 
 
 def _generate_square(search_space: SectionSearchSpace) -> list[SectionVariant]:
+    """I = a⁴/12,  W = a³/6,  A = a²."""
     secondary_values = _iterate_range(search_space.secondary) if search_space.secondary is not None else _iterate_range(search_space.primary)
     side_values = sorted(
         {
@@ -93,6 +105,7 @@ def _generate_square(search_space: SectionSearchSpace) -> list[SectionVariant]:
 
 
 def _generate_solid_round(search_space: SectionSearchSpace) -> list[SectionVariant]:
+    """I = π·d⁴/64,  W = π·d³/32,  A = π·d²/4."""
     secondary_values = _iterate_range(search_space.secondary) if search_space.secondary is not None else _iterate_range(search_space.primary)
     diameter_values = sorted(
         {
@@ -121,6 +134,11 @@ def _generate_solid_round(search_space: SectionSearchSpace) -> list[SectionVaria
 
 
 def _generate_round_tube(search_space: SectionSearchSpace) -> list[SectionVariant]:
+    """I = π(D⁴ − d⁴)/64,  W = I / (D/2),  A = π(D² − d²)/4,  d = D − 2t.
+
+    Wall thickness t is clamped to 0.45·D to prevent geometrically invalid tubes
+    (t must satisfy 2t < D, i.e. inner diameter d > 0).
+    """
     if search_space.secondary is None:
         raise ValueError("Round tube requires two ranges.")
 

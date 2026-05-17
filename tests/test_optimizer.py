@@ -408,19 +408,21 @@ class OptimizationTests(unittest.TestCase):
         self.assertTrue(all(candidate.is_feasible for candidate in summary.selected))
         self.assertEqual(summary.selected[0].section.dimensions_mm, {"width": 40.0, "height": 90.0})
 
-    def test_no_feasible_candidates_returns_infeasible_fallback(self) -> None:
-        """When constraints are impossible, selected list contains infeasible candidates."""
+    def test_no_feasible_candidates_populates_alternatives(self) -> None:
+        """When constraints are impossible, alternatives holds the closest infeasible
+        candidates so the user can see what failed and by how much."""
         request = _make_request(
             SupportType.SIMPLY_SUPPORTED,
             LoadCase(LoadType.CENTER_POINT, 10_000.0),
-            constraints=Constraints(max_stress_pa=1.0),  # 1 Pa — impossible
-            top_n=1,
+            constraints=Constraints(max_stress_pa=1.0),  # 1 Pa — physically impossible
+            top_n=2,
         )
         summary = run_optimization(request)
         self.assertEqual(summary.feasible_count, 0)
-        self.assertEqual(len(summary.selected), 1)
-        self.assertFalse(summary.selected[0].is_feasible)
-        self.assertTrue(len(summary.selected[0].violations) > 0)
+        self.assertEqual(len(summary.selected), 0)
+        self.assertGreater(len(summary.alternatives), 0)
+        self.assertTrue(all(not c.is_feasible for c in summary.alternatives))
+        self.assertTrue(all(len(c.violations) > 0 for c in summary.alternatives))
 
     def test_max_safety_factor_goal_selects_safest_first(self) -> None:
         """MAX_SAFETY_FACTOR goal ranks by descending safety factor."""
@@ -483,6 +485,212 @@ class OptimizationTests(unittest.TestCase):
         )
         summary = run_optimization(tight_request)
         self.assertEqual(summary.feasible_count, 0)
+
+
+# ── dimension constraints ─────────────────────────────────────────────────────
+
+class DimensionConstraintTests(unittest.TestCase):
+    """Verify that max_primary_dimension_mm and max_secondary_dimension_mm
+    are correctly checked and reflected in candidate feasibility."""
+
+    def _wide_search(self) -> SectionSearchSpace:
+        return SectionSearchSpace(
+            primary=NumericRange(40.0, 120.0, 40.0),    # 40, 80, 120
+            secondary=NumericRange(60.0, 120.0, 60.0),  # 60, 120  → 6 combos
+        )
+
+    def test_max_primary_dimension_excludes_oversized(self) -> None:
+        """Sections with width > limit must be infeasible."""
+        request = BeamRequest(
+            length_m=2.0,
+            section_type=SectionType.RECTANGULAR,
+            material=get_material_by_title("Сталь"),
+            support_type=SupportType.SIMPLY_SUPPORTED,
+            load_case=LoadCase(LoadType.CENTER_POINT, 10_000.0),
+            search_space=self._wide_search(),
+            constraints=Constraints(max_primary_dimension_mm=79.0),  # only width=40 passes
+            optimization_goal=OptimizationGoal.MIN_WEIGHT,
+            top_n=6,
+            output_dir=Path("output"),
+        )
+        summary = run_optimization(request)
+        for candidate in summary.selected:
+            width = candidate.section.dimensions_mm["width"]
+            if candidate.is_feasible:
+                self.assertLessEqual(width, 79.0)
+            else:
+                self.assertGreater(width, 79.0)
+
+    def test_max_secondary_dimension_excludes_oversized(self) -> None:
+        """Sections with height > limit must be infeasible."""
+        request = BeamRequest(
+            length_m=2.0,
+            section_type=SectionType.RECTANGULAR,
+            material=get_material_by_title("Сталь"),
+            support_type=SupportType.SIMPLY_SUPPORTED,
+            load_case=LoadCase(LoadType.CENTER_POINT, 10_000.0),
+            search_space=self._wide_search(),
+            constraints=Constraints(max_secondary_dimension_mm=61.0),  # only height=60 passes
+            optimization_goal=OptimizationGoal.MIN_WEIGHT,
+            top_n=6,
+            output_dir=Path("output"),
+        )
+        summary = run_optimization(request)
+        for candidate in summary.selected:
+            height = candidate.section.dimensions_mm["height"]
+            if candidate.is_feasible:
+                self.assertLessEqual(height, 61.0)
+
+    def test_both_dimension_constraints_combined(self) -> None:
+        """Primary and secondary dimension limits both active simultaneously."""
+        request = BeamRequest(
+            length_m=2.0,
+            section_type=SectionType.RECTANGULAR,
+            material=get_material_by_title("Сталь"),
+            support_type=SupportType.SIMPLY_SUPPORTED,
+            load_case=LoadCase(LoadType.CENTER_POINT, 10_000.0),
+            search_space=self._wide_search(),
+            constraints=Constraints(
+                max_primary_dimension_mm=41.0,   # only 40 passes
+                max_secondary_dimension_mm=61.0, # only 60 passes
+            ),
+            optimization_goal=OptimizationGoal.MIN_WEIGHT,
+            top_n=6,
+            output_dir=Path("output"),
+        )
+        summary = run_optimization(request)
+        feasible = [c for c in summary.selected if c.is_feasible]
+        self.assertEqual(len(feasible), 1)
+        self.assertEqual(feasible[0].section.dimensions_mm, {"width": 40.0, "height": 60.0})
+
+    def test_dimension_constraint_single_param_section(self) -> None:
+        """Primary dimension limit works for single-parameter sections (square)."""
+        request = BeamRequest(
+            length_m=2.0,
+            section_type=SectionType.SQUARE,
+            material=get_material_by_title("Сталь"),
+            support_type=SupportType.SIMPLY_SUPPORTED,
+            load_case=LoadCase(LoadType.CENTER_POINT, 10_000.0),
+            search_space=SectionSearchSpace(primary=NumericRange(80.0, 160.0, 40.0)),  # 80, 120, 160
+            constraints=Constraints(max_primary_dimension_mm=121.0),
+            optimization_goal=OptimizationGoal.MIN_WEIGHT,
+            top_n=3,
+            output_dir=Path("output"),
+        )
+        summary = run_optimization(request)
+        for c in summary.selected:
+            if c.is_feasible:
+                self.assertLessEqual(c.section.dimensions_mm["side"], 121.0)
+
+
+# ── materials ─────────────────────────────────────────────────────────────────
+
+class MaterialsTests(unittest.TestCase):
+    """Verify material database correctness and lookup behaviour."""
+
+    def test_all_materials_retrievable_by_title(self) -> None:
+        from beam_optimizer.materials import MATERIALS, get_material_by_title, material_titles
+        for title in material_titles():
+            mat = get_material_by_title(title)
+            self.assertEqual(mat.title, title)
+
+    def test_unknown_title_raises_key_error(self) -> None:
+        from beam_optimizer.materials import get_material_by_title
+        with self.assertRaises(KeyError):
+            get_material_by_title("Мифрил")
+
+    def test_material_properties_physically_reasonable(self) -> None:
+        """Sanity-check: E > 0, ρ > 0, σ_y > 0, and values are in plausible SI ranges."""
+        from beam_optimizer.materials import MATERIALS
+        for mat in MATERIALS.values():
+            self.assertGreater(mat.elastic_modulus_pa, 1e9,   msg=f"{mat.title}: E suspiciously low")
+            self.assertLess(mat.elastic_modulus_pa,    1e12,  msg=f"{mat.title}: E suspiciously high")
+            self.assertGreater(mat.density_kg_m3,      500.0, msg=f"{mat.title}: ρ suspiciously low")
+            self.assertLess(mat.density_kg_m3,         1e4,   msg=f"{mat.title}: ρ suspiciously high")
+            self.assertGreater(mat.yield_strength_pa,  1e6,   msg=f"{mat.title}: σ_y suspiciously low")
+            self.assertLess(mat.yield_strength_pa,     2e9,   msg=f"{mat.title}: σ_y suspiciously high")
+
+    def test_steel_values_match_gost_s235(self) -> None:
+        """Steel constants must match ГОСТ 380-2005 / EN 10025-2 S235 nominal values."""
+        from beam_optimizer.materials import get_material_by_title
+        steel = get_material_by_title("Сталь")
+        self.assertAlmostEqual(steel.elastic_modulus_pa, 210e9, delta=1e9)
+        self.assertAlmostEqual(steel.density_kg_m3,      7850.0, delta=10.0)
+        self.assertAlmostEqual(steel.yield_strength_pa,  250e6, delta=1e6)
+
+
+# ── reporting ─────────────────────────────────────────────────────────────────
+
+class ReportingTests(unittest.TestCase):
+    """Verify that the reporting module creates correct output files."""
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = tempfile.mkdtemp()
+        self._tmp_path = Path(self._tmp)
+
+    def tearDown(self) -> None:
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _build_request(self, output_dir: Path) -> BeamRequest:
+        return BeamRequest(
+            length_m=2.0,
+            section_type=SectionType.RECTANGULAR,
+            material=get_material_by_title("Сталь"),
+            support_type=SupportType.SIMPLY_SUPPORTED,
+            load_case=LoadCase(LoadType.CENTER_POINT, 10_000.0),
+            search_space=_SEARCH_100x200,
+            constraints=Constraints(),
+            optimization_goal=OptimizationGoal.MIN_WEIGHT,
+            top_n=1,
+            output_dir=output_dir,
+        )
+
+    def test_ensure_output_structure_creates_dirs(self) -> None:
+        from beam_optimizer.reporting import ensure_output_structure
+        dirs = ensure_output_structure(self._tmp_path / "output")
+        for key in ("root", "models", "reports", "logs"):
+            self.assertIn(key, dirs)
+            self.assertTrue(dirs[key].is_dir(), msg=f"Directory '{key}' was not created")
+
+    def test_save_run_report_creates_valid_json(self) -> None:
+        import json
+        from beam_optimizer.reporting import ensure_output_structure, save_run_report
+        request = self._build_request(self._tmp_path / "output")
+        dirs = ensure_output_structure(request.output_dir)
+        summary = run_optimization(request)
+        report_path = save_run_report(request, summary, dirs["reports"])
+        self.assertTrue(report_path.exists())
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        for key in ("length_m", "section_type", "material", "total_generated",
+                    "feasible_count", "selected", "alternatives"):
+            self.assertIn(key, payload, msg=f"Key '{key}' missing from report JSON")
+        self.assertEqual(payload["total_generated"], summary.total_generated)
+        self.assertEqual(payload["feasible_count"], summary.feasible_count)
+        self.assertEqual(len(payload["selected"]), len(summary.selected))
+
+    def test_save_run_report_selected_fields_complete(self) -> None:
+        """Each selected candidate in the report must contain all required fields."""
+        import json
+        from beam_optimizer.reporting import ensure_output_structure, save_run_report
+        request = self._build_request(self._tmp_path / "output")
+        dirs = ensure_output_structure(request.output_dir)
+        summary = run_optimization(request)
+        report_path = save_run_report(request, summary, dirs["reports"])
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        for candidate_dict in payload["selected"]:
+            for field in ("section", "dimensions_mm", "mass_kg", "max_stress_pa",
+                          "max_deflection_m", "safety_factor", "is_feasible", "violations"):
+                self.assertIn(field, candidate_dict, msg=f"Field '{field}' missing from candidate dict")
+
+    def test_clear_output_structure_removes_directory(self) -> None:
+        from beam_optimizer.reporting import clear_output_structure, ensure_output_structure
+        out = self._tmp_path / "output"
+        ensure_output_structure(out)
+        self.assertTrue(out.exists())
+        clear_output_structure(out)
+        self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":
