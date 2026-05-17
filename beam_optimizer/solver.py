@@ -1,12 +1,28 @@
 from __future__ import annotations
 
+import logging
+import math
+
 from beam_optimizer.models import AnalysisResult, BeamRequest, LoadType, SectionVariant, SupportType
 
+logger = logging.getLogger(__name__)
 
 DEFAULT_ELEMENTS = 60
 
+_SLENDERNESS_THRESHOLD = 10.0
+
 
 def analyze_section(request: BeamRequest, section: SectionVariant) -> AnalysisResult:
+    # h_equiv = height of a rectangle with the same I/A ratio; equals actual height for rect sections.
+    h_equiv = 2.0 * math.sqrt(3.0 * section.inertia_m4 / section.area_m2)
+    slenderness = request.length_m / h_equiv
+    if slenderness < _SLENDERNESS_THRESHOLD:
+        logger.warning(
+            "Коэффициент гибкости L/h = %.1f < 10 для сечения '%s'. "
+            "Теория Эйлера-Бернулли даёт заниженные напряжения для коротких толстых балок.",
+            slenderness,
+            section.title,
+        )
     nodes = _build_nodes(request.length_m, request.load_case)
     stiffness = _zeros_matrix(2 * len(nodes), 2 * len(nodes))
     load_vector = [0.0 for _ in range(2 * len(nodes))]
