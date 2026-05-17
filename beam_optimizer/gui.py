@@ -175,7 +175,7 @@ class BeamOptimizerApp:
             justify=tk.LEFT,
         )
         description_label.grid(row=12, column=0, sticky="w", pady=(2, 8))
-        self._add_labeled_entry(frame, "Сколько лучших вариантов показать", self.top_n_var, row=6)
+        self._add_labeled_entry(frame, "Сколько лучших вариантов показать", self.top_n_var, row=7)
 
     def _build_actions_frame(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Запуск", padding=10)

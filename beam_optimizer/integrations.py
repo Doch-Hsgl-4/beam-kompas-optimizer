@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -121,7 +123,7 @@ class KompasAdapter:
             raise RuntimeError("Для создания модели в КОМПАС нужен пакет pywin32.") from error
 
         try:
-            kompas = win32_client.gencache.EnsureDispatch(KOMPAS_API7_PROGID)
+            kompas = self._ensure_dispatch_with_cache_repair(win32_client)
         except Exception as error:
             raise RuntimeError(
                 "Не удалось подключиться к COM-серверу КОМПАС API 7. Проверьте установленный КОМПАС-3D и регистрацию COM."
@@ -132,6 +134,26 @@ class KompasAdapter:
         self._win32_client = win32_client
         logger.info("Connected to KOMPAS COM server via %s", KOMPAS_API7_PROGID)
         return kompas
+
+    @staticmethod
+    def _ensure_dispatch_with_cache_repair(win32_client):
+        try:
+            return win32_client.gencache.EnsureDispatch(KOMPAS_API7_PROGID)
+        except AttributeError as error:
+            if "MinorVersion" not in str(error):
+                raise
+            cache_path = Path(win32_client.gencache.GetGeneratePath())
+            logger.warning("Broken pywin32 COM cache detected at %s; rebuilding it.", cache_path)
+            try:
+                win32_client.gencache.is_readonly = False
+                for module_name in list(sys.modules):
+                    if module_name.startswith("win32com.gen_py."):
+                        sys.modules.pop(module_name, None)
+                shutil.rmtree(cache_path, ignore_errors=True)
+                win32_client.gencache.Rebuild()
+            except Exception as rebuild_error:
+                logger.warning("Failed to rebuild pywin32 COM cache: %s", rebuild_error)
+            return win32_client.gencache.EnsureDispatch(KOMPAS_API7_PROGID)
 
     def _create_document3d(self, kompas):
         document = kompas.Documents.Add(DOCUMENT_PART, True)
